@@ -4,7 +4,7 @@ This is a library for simple [outbox](https://microservices.io/patterns/data/tra
 
 ## How to use
 
-[example](https://github.com/koolay/outbox/_example)
+[example](https://github.com/koolay/outbox/tree/main/_example)
 
 **Main service**
 
