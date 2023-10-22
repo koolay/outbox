@@ -2,24 +2,27 @@ package pg
 
 import (
 	"context"
-	"fmt"
 
 	"github.com/jmoiron/sqlx"
+	"github.com/pkg/errors"
 
 	"github.com/koolay/outbox/store/types"
 )
 
 const (
-	sqlGetPositionWithLockForPg = `SELECT position FROM "cursor" WHERE "process_name" = $1 LIMIT 1 FOR UPDATE SKIP LOCKED `
-	sqlSetPositionForPg         = `UPDATE "cursor"  SET "position" = $1 WHERE "process_name" = $2`
-	sqlInsertMessageForPg       = `INSERT INTO "outbox" ("body") VALUES ($1)`
-	sqlGetMessagesFromPosForPg  = `SELECT * FROM "outbox"
+	sqlGetPositionWithLock = `SELECT position FROM "cursor" WHERE "process_name" = $1 LIMIT 1 FOR UPDATE SKIP LOCKED `
+	sqlSetPosition         = `UPDATE "cursor"  SET "position" = $1 WHERE "process_name" = $2`
+	sqlInsertMessage       = `INSERT INTO "outbox" ("process_name", "body") VALUES ($1, $2)`
+	sqlGetMessagesFromPos  = `SELECT * FROM "outbox"
     WHERE "created_at" > (
       SELECT "created_at" FROM "outbox"
       WHERE "id" = $1
       LIMIT 1
     ) AND "created_at" < (NOW() - INTERVAL '20 milliseconds') and process_name = $2
-    ORDER BY "created_at" ASC`
+    ORDER BY "created_at" ASC LIMIT $3`
+	sqlUpsertCursor = `INSERT INTO cursor (process_name, position) VALUES ($1, $2) 
+	ON CONFLICT (process_name) DO UPDATE 
+  SET position = excluded.position;`
 )
 
 func init() {
@@ -27,24 +30,40 @@ func init() {
 }
 
 type Postgres struct {
-	name string
 	sess *sqlx.DB
 }
 
 func (postgres *Postgres) Init(option *types.Option) {
-	postgres.name = option.ProcessName
 	postgres.sess = option.DB
+}
+
+func (postgres *Postgres) UpsertCursor(ctx context.Context, cursor types.Cursor) error {
+	postgres.sess.ExecContext(
+		ctx,
+		sqlUpsertCursor,
+		cursor.ProcessName,
+		cursor.Position,
+	)
+	return nil
 }
 
 func (postgres *Postgres) GetMessagesFromPos(
 	ctx context.Context,
 	processName string,
-	pos int64,
-) ([]types.Message, error) {
-	var messages []types.Message
-	err := postgres.sess.SelectContext(ctx, &messages, sqlGetMessagesFromPosForPg, processName, pos)
+	position int64,
+	limit int,
+) ([]types.Outbox, error) {
+	var messages []types.Outbox
+	err := postgres.sess.SelectContext(
+		ctx,
+		&messages,
+		sqlGetMessagesFromPos,
+		position,
+		processName,
+		limit,
+	)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get messages, error: %w", err)
+		return nil, errors.Wrap(err, "failed to get messages")
 	}
 
 	return messages, nil
@@ -54,37 +73,30 @@ func (postgres *Postgres) GetMessagesFromPos(
 func (postgres *Postgres) AddMessage(
 	ctx context.Context,
 	tx *sqlx.Tx,
-	message types.Message,
+	message types.Outbox,
 ) error {
-	_, err := tx.ExecContext(ctx, sqlInsertMessageForPg, message.Body)
+	_, err := tx.ExecContext(ctx, sqlInsertMessage, message.ProcessName, message.Body)
 	if err != nil {
-		return fmt.Errorf("failed to add message, error: %w", err)
+		return errors.Wrap(err, "failed to add message")
 	}
 
 	return nil
 }
 
-func NewPostgres(sess *sqlx.DB, name string) *Postgres {
-	return &Postgres{
-		name: name,
-		sess: sess,
-	}
-}
-
 func (c *Postgres) GetPositionWithLock(ctx context.Context, processName string) (int64, error) {
 	var position int64
-	err := c.sess.GetContext(ctx, &position, sqlGetPositionWithLockForPg, processName)
+	err := c.sess.GetContext(ctx, &position, sqlGetPositionWithLock, processName)
 	if err != nil {
-		return 0, fmt.Errorf("failed to get next position, error: %w", err)
+		return 0, errors.Wrap(err, "failed to get next position")
 	}
 
 	return position, nil
 }
 
 func (c *Postgres) SetPosition(ctx context.Context, processName string, position int64) error {
-	_, err := c.sess.ExecContext(ctx, sqlSetPositionForPg, position, c.name)
+	_, err := c.sess.ExecContext(ctx, sqlSetPosition, position, processName)
 	if err != nil {
-		return fmt.Errorf("failed to set next position, error: %w", err)
+		return errors.Wrap(err, "failed to set next position")
 	}
 
 	return nil

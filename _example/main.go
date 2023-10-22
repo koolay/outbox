@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"log"
 	"log/slog"
 	"os"
 	"os/signal"
@@ -22,39 +23,36 @@ import (
 )
 
 var (
-	processName       = "tester"
+	processName       = "order_processor"
 	totalTestMsgCount = 1000
 )
 
 func panicIf(err error) {
 	if err != nil {
-		panic(err)
+		log.Fatalf("%+v", err)
 	}
 }
 
 func initLog() {
 	logHandler := slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
 		AddSource: true,
-		Level:     slog.LevelInfo,
+		Level:     slog.LevelDebug,
 	})
 
 	slog.SetDefault(slog.New(logHandler))
 }
 
-func connect() (*sqlx.DB, error) {
+func connect(connStr string) (*sqlx.DB, error) {
 	slog.Info("start to connect to db")
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-
 	db, err := sqlx.ConnectContext(
-		ctx,
+		context.Background(),
 		"postgres",
-		"host=localhost port=5543 user=postgres password=postgres dbname=goutbox sslmode=disable",
+		connStr,
 	)
 	return db, err
 }
 
-func startPgServer(quit <-chan struct{}) testcontainers.Container {
+func startPgServer(ctx context.Context) (testcontainers.Container, *sqlx.DB) {
 	dbName := "goutbox"
 	dbUser := "postgres"
 	dbPassword := "postgres"
@@ -69,23 +67,19 @@ func startPgServer(quit <-chan struct{}) testcontainers.Container {
 				WithOccurrence(2).
 				WithStartupTimeout(2*time.Minute)),
 	)
-
 	panicIf(err)
-	// defer func() {
-	// 	if err := pgc.Terminate(ctx); err != nil {
-	// 		panic(err)
-	// 	}
-	// }()
 
-	time.Sleep(1 * time.Second)
+	connStr, err := pgc.ConnectionString(context.Background(), "sslmode=disable")
+	slog.Info("started pg server", "conn", connStr)
+	panicIf(err)
 
-	db, err := connect()
+	db, err := connect(connStr)
 	panicIf(err)
 
 	slog.Info("start run migrations")
-
-	goose.Up(db.DB, "migrations")
-	return pgc
+	err = goose.Up(db.DB, "../deploy/pg_sql", goose.WithNoVersioning())
+	panicIf(err)
+	return pgc, db
 }
 
 func initApp() *cli.App {
@@ -96,17 +90,13 @@ func initApp() *cli.App {
 				Usage: "process the message from outbox",
 				Action: func(c *cli.Context) error {
 					ctx := c.Context
-					chQuit := make(chan struct{})
 
-					dbserver := startPgServer(chQuit)
+					dbserver, db := startPgServer(ctx)
 					defer dbserver.Terminate(ctx)
-
-					db, err := connect()
-					panicIf(err)
 
 					processor := outbox.NewProcessor(
 						"order_processor",
-						func(ctx context.Context, msg types.Message) error {
+						func(ctx context.Context, msg types.Outbox) error {
 							slog.Info(
 								"message received, and handle it",
 								"body",
@@ -121,13 +111,21 @@ func initApp() *cli.App {
 						outbox.WithMsgBufferSize(3),
 					)
 
-					chSignal := make(chan os.Signal, 1)
-					signal.Notify(chSignal, os.Interrupt, syscall.SIGTERM)
+					slog.Info("init cursor")
+					panicIf(processor.InitCursor(ctx, 1))
 
-					go panicIf(processor.Start(ctx))
+					chSignal := make(chan os.Signal, 1)
+					signal.Notify(chSignal, os.Interrupt, syscall.SIGINT, syscall.SIGTERM)
+
+					slog.Info("start processor")
+					go func() {
+						panicIf(processor.Start(ctx))
+					}()
+
 					select {
 					case <-chSignal:
-						processor.Shutdown(ctx)
+						slog.Info("received signal to shutdown")
+						panicIf(processor.Shutdown(ctx))
 					}
 					return nil
 				},
@@ -135,20 +133,27 @@ func initApp() *cli.App {
 			{
 				Name:  "main",
 				Usage: "main service",
+				Flags: []cli.Flag{
+					&cli.StringFlag{
+						Name:  "conn",
+						Usage: "connection string",
+						Value: "postgres://postgres:postgres@localhost:5432/goutbox?sslmode=disable",
+					},
+				},
 				Action: func(c *cli.Context) error {
 					ctx := c.Context
 
-					chQuit := make(chan struct{})
-					dbserver := startPgServer(chQuit)
-					defer dbserver.Terminate(ctx)
-					db, err := connect()
+					db, err := connect(c.String("conn"))
 					panicIf(err)
 
 					chSignal := make(chan os.Signal, 1)
-					signal.Notify(chSignal, os.Interrupt, syscall.SIGTERM)
+					signal.Notify(chSignal, os.Interrupt, syscall.SIGINT, syscall.SIGTERM)
+
 					go func() {
 						storage := types.GetStorager()
-						storage.Init(&types.Option{})
+						storage.Init(&types.Option{
+							DB: db,
+						})
 						var i int
 						for {
 							tx, err := db.Beginx()
@@ -168,15 +173,23 @@ func initApp() *cli.App {
 								msg,
 							)
 							if err != nil {
-								panicIf(tx.Rollback())
+								slog.Error("insert message failed", "err", err)
+								if errRoll := tx.Rollback(); errRoll != nil {
+									slog.Error("rollback failed", "err", errRoll)
+								}
+								return
 							}
 
 							// send message to outbox
-							if err := storage.AddMessage(ctx, tx, types.Message{
+							if err := storage.AddMessage(ctx, tx, types.Outbox{
 								ProcessName: processName,
 								Body:        []byte(msg),
 							}); err != nil {
-								panicIf(tx.Rollback())
+								slog.Error("insert outbox failed", "err", err)
+								if errRoll := tx.Rollback(); errRoll != nil {
+									slog.Error("rollback failed", "err", errRoll)
+								}
+								return
 							}
 
 							panicIf(tx.Commit())
@@ -198,6 +211,7 @@ func initApp() *cli.App {
 }
 
 func main() {
+	initLog()
 	app := initApp()
 	panicIf(app.Run(os.Args))
 }
