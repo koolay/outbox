@@ -37,6 +37,7 @@ type (
 		concurrentWorkers   int
 		intervalMillseconds int
 		limitPerFetch       int
+		positionLock        sync.Mutex
 	}
 )
 
@@ -62,6 +63,7 @@ func NewProcessor(
 		limitPerFetch:       defaultLimitPerFetch,
 		msgHandle:           msgHandle,
 		chDone:              make(chan struct{}, 1),
+		positionLock:        sync.Mutex{},
 	}
 
 	for _, option := range options {
@@ -164,9 +166,12 @@ func (p *Processor) InitCursor(ctx context.Context, position int64) error {
 	})
 }
 
+// Start starts the processor and processes messages from a specified position.
+//
+// ctx: the context.Context object for cancellation and timeouts.
+// Returns an error if there was an issue processing the messages.
 func (p *Processor) Start(ctx context.Context) error {
 	var errRtv error
-	var positionLock sync.Mutex
 
 	for {
 		if p.isQuit.Load() {
@@ -197,25 +202,8 @@ func (p *Processor) Start(ctx context.Context) error {
 			time.Sleep(5 * time.Second)
 		}
 
-		var latestPosition int64
-		pl := pool.New().WithMaxGoroutines(10).WithContext(ctx).WithCancelOnError()
-		for _, msg := range msgs {
-			msg := msg
-			pl.Go(func(ctx context.Context) error {
-				if errHandle := p.msgHandle(ctx, msg); errHandle != nil {
-					return errHandle
-				}
-				positionLock.Lock()
-				if latestPosition < msg.ID {
-					latestPosition = msg.ID
-				}
-				positionLock.Unlock()
-				return nil
-			})
-		}
-
-		if errWait := pl.Wait(); errWait != nil {
-			errRtv = errWait
+		latestPosition, err := p.processMessages(ctx, msgs)
+		if err != nil {
 			break
 		}
 
@@ -230,6 +218,27 @@ func (p *Processor) Start(ctx context.Context) error {
 
 	p.chDone <- struct{}{}
 	return errRtv
+}
+func (p *Processor) processMessages(ctx context.Context, msgs []types.Outbox) (int64, error) {
+	var maxPosition int64
+	pl := pool.New().WithMaxGoroutines(10).WithContext(ctx).WithCancelOnError()
+	for _, msg := range msgs {
+		msg := msg
+		pl.Go(func(ctx context.Context) error {
+			if errHandle := p.msgHandle(ctx, msg); errHandle != nil {
+				return errHandle
+			}
+			p.positionLock.Lock()
+			if maxPosition < msg.ID {
+				maxPosition = msg.ID
+			}
+			p.positionLock.Unlock()
+			return nil
+		})
+	}
+
+	err := pl.Wait()
+	return maxPosition, err
 }
 
 func (p *Processor) Shutdown() error {
