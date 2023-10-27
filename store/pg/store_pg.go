@@ -33,28 +33,30 @@ type Postgres struct {
 	sess *sqlx.DB
 }
 
-func (postgres *Postgres) Init(option *types.Option) {
-	postgres.sess = option.DB
+func (pg *Postgres) Init(option *types.Option) {
+	pg.sess = option.DB
 }
 
-func (postgres *Postgres) UpsertCursor(ctx context.Context, cursor types.Cursor) error {
-	postgres.sess.ExecContext(
+func (pg *Postgres) UpsertCursor(ctx context.Context, cursor types.Cursor) error {
+	if _, err := pg.sess.ExecContext(
 		ctx,
 		sqlUpsertCursor,
 		cursor.ProcessName,
 		cursor.Position,
-	)
+	); err != nil {
+		return errors.Wrap(err, "failed to upsert cursor")
+	}
 	return nil
 }
 
-func (postgres *Postgres) GetMessagesFromPos(
+func (pg *Postgres) GetMessagesFromPos(
 	ctx context.Context,
 	processName string,
 	position int64,
 	limit int,
 ) ([]types.Outbox, error) {
 	var messages []types.Outbox
-	err := postgres.sess.SelectContext(
+	err := pg.sess.SelectContext(
 		ctx,
 		&messages,
 		sqlGetMessagesFromPos,
@@ -70,7 +72,7 @@ func (postgres *Postgres) GetMessagesFromPos(
 }
 
 // AddMessage adds message to outbox
-func (postgres *Postgres) AddMessage(
+func (pg *Postgres) AddMessage(
 	ctx context.Context,
 	tx *sqlx.Tx,
 	message types.Outbox,
@@ -83,9 +85,9 @@ func (postgres *Postgres) AddMessage(
 	return nil
 }
 
-func (c *Postgres) GetPositionWithLock(ctx context.Context, processName string) (int64, error) {
+func (pg *Postgres) GetPositionWithLock(ctx context.Context, processName string) (int64, error) {
 	var position int64
-	err := c.sess.GetContext(ctx, &position, sqlGetPositionWithLock, processName)
+	err := pg.sess.GetContext(ctx, &position, sqlGetPositionWithLock, processName)
 	if err != nil {
 		return 0, errors.Wrap(err, "failed to get next position")
 	}
@@ -93,8 +95,8 @@ func (c *Postgres) GetPositionWithLock(ctx context.Context, processName string) 
 	return position, nil
 }
 
-func (c *Postgres) SetPosition(ctx context.Context, processName string, position int64) error {
-	_, err := c.sess.ExecContext(ctx, sqlSetPosition, position, processName)
+func (pg *Postgres) SetPosition(ctx context.Context, processName string, position int64) error {
+	_, err := pg.sess.ExecContext(ctx, sqlSetPosition, position, processName)
 	if err != nil {
 		return errors.Wrap(err, "failed to set next position")
 	}

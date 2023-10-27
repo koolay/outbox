@@ -41,3 +41,8 @@ CREATE TABLE example (
      subject TEXT NOT NULL
 );
 
+CREATE TABLE sinked (
+     id SERIAL NOT NULL PRIMARY KEY,
+     subject TEXT NOT NULL
+);
+

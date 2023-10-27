@@ -11,15 +11,12 @@ import (
 	"time"
 
 	"github.com/jmoiron/sqlx"
-	"github.com/koolay/outbox"
 	_ "github.com/koolay/outbox/store/pg"
-	"github.com/koolay/outbox/store/types"
 	_ "github.com/lib/pq"
 	"github.com/pressly/goose/v3"
 	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/modules/postgres"
 	"github.com/testcontainers/testcontainers-go/wait"
-	cli "github.com/urfave/cli/v2"
 )
 
 var (
@@ -52,7 +49,7 @@ func connect(connStr string) (*sqlx.DB, error) {
 	return db, err
 }
 
-func startPgServer(ctx context.Context) (testcontainers.Container, *sqlx.DB) {
+func setupAndstartPgServer(ctx context.Context) (testcontainers.Container, *sqlx.DB) {
 	dbName := "goutbox"
 	dbUser := "postgres"
 	dbPassword := "postgres"
@@ -82,136 +79,47 @@ func startPgServer(ctx context.Context) (testcontainers.Container, *sqlx.DB) {
 	return pgc, db
 }
 
-func initApp() *cli.App {
-	app := cli.App{
-		Commands: []*cli.Command{
-			{
-				Name:  "proc",
-				Usage: "process the message from outbox",
-				Action: func(c *cli.Context) error {
-					ctx := c.Context
-
-					dbserver, db := startPgServer(ctx)
-					defer dbserver.Terminate(ctx)
-
-					processor := outbox.NewProcessor(
-						"order_processor",
-						func(ctx context.Context, msg types.Outbox) error {
-							slog.Info(
-								"message received, and handle it",
-								"body",
-								string(msg.Body),
-								"processor",
-								msg.ProcessName,
-							)
-							return nil
-						},
-						db,
-						outbox.WithConcurrentWorkers(2),
-						outbox.WithMsgBufferSize(3),
-					)
-
-					slog.Info("init cursor")
-					panicIf(processor.InitCursor(ctx, 1))
-
-					chSignal := make(chan os.Signal, 1)
-					signal.Notify(chSignal, os.Interrupt, syscall.SIGINT, syscall.SIGTERM)
-
-					slog.Info("start processor")
-					go func() {
-						panicIf(processor.Start(ctx))
-					}()
-
-					select {
-					case <-chSignal:
-						slog.Info("received signal to shutdown")
-						panicIf(processor.Shutdown(ctx))
-					}
-					return nil
-				},
-			},
-			{
-				Name:  "main",
-				Usage: "main service",
-				Flags: []cli.Flag{
-					&cli.StringFlag{
-						Name:  "conn",
-						Usage: "connection string",
-						Value: "postgres://postgres:postgres@localhost:5432/goutbox?sslmode=disable",
-					},
-				},
-				Action: func(c *cli.Context) error {
-					ctx := c.Context
-
-					db, err := connect(c.String("conn"))
-					panicIf(err)
-
-					chSignal := make(chan os.Signal, 1)
-					signal.Notify(chSignal, os.Interrupt, syscall.SIGINT, syscall.SIGTERM)
-
-					go func() {
-						storage := types.GetStorager()
-						storage.Init(&types.Option{
-							DB: db,
-						})
-						var i int
-						for {
-							tx, err := db.Beginx()
-							panicIf(err)
-
-							if i >= totalTestMsgCount {
-								slog.Info("test finished")
-								return
-							}
-
-							i++
-							// do main business
-							msg := fmt.Sprintf("test: %v", i)
-							_, err = tx.ExecContext(
-								ctx,
-								"insert into example (subject) values ($1)",
-								msg,
-							)
-							if err != nil {
-								slog.Error("insert message failed", "err", err)
-								if errRoll := tx.Rollback(); errRoll != nil {
-									slog.Error("rollback failed", "err", errRoll)
-								}
-								return
-							}
-
-							// send message to outbox
-							if err := storage.AddMessage(ctx, tx, types.Outbox{
-								ProcessName: processName,
-								Body:        []byte(msg),
-							}); err != nil {
-								slog.Error("insert outbox failed", "err", err)
-								if errRoll := tx.Rollback(); errRoll != nil {
-									slog.Error("rollback failed", "err", errRoll)
-								}
-								return
-							}
-
-							panicIf(tx.Commit())
-							slog.Info("insert message success", "num", i)
-							time.Sleep(500 * time.Millisecond)
-						}
-					}()
-					select {
-					case <-chSignal:
-						slog.Info("main service is shutdown")
-					}
-
-					return nil
-				},
-			},
-		},
+func checkResult(db *sqlx.DB) error {
+	ctx := context.Background()
+	var source int
+	var dest int
+	err := db.GetContext(ctx, &source, "select count(*) from example")
+	if err != nil {
+		return fmt.Errorf("failed to get source count: %w", err)
 	}
-	return &app
+
+	err = db.GetContext(ctx, &dest, "select count(*) from sinked")
+	if err != nil {
+		return fmt.Errorf("failed to get dest count: %w", err)
+	}
+
+	slog.Info("check result", "source", source, "dest", dest)
+	return nil
 }
 
 func main() {
+	chQuit := make(chan struct{}, 1)
+	chSignal := make(chan os.Signal, 1)
+	signal.Notify(chSignal, os.Interrupt, syscall.SIGINT, syscall.SIGTERM)
 	initLog()
-	app := initApp()
-	panicIf(app.Run(os.Args))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	dbserver, db := setupAndstartPgServer(ctx)
+	defer func() {
+		panicIf(dbserver.Terminate(ctx))
+	}()
+
+	go createOrder(ctx, db)
+
+	chDone := make(chan struct{}, 1)
+	go process(db, chQuit, chDone)
+
+	<-chSignal
+	quitCreating.Store(true)
+	close(chQuit)
+	slog.Info("main service is shutdown, and wait for processor graceful shutdown")
+	<-chDone
+	panicIf(checkResult(db))
 }

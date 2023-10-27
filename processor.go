@@ -136,16 +136,6 @@ func (p *Processor) setPosition(ctx context.Context, processName string, positio
 	return nil
 }
 
-func (p *Processor) addMessage(ctx context.Context, tx *sqlx.Tx, message types.Outbox) error {
-	sqlctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-	err := p.storage.AddMessage(sqlctx, tx, message)
-	if err != nil {
-		return err
-	}
-	return nil
-}
-
 func (p *Processor) getMessagesFromPos(
 	ctx context.Context,
 	processName string,
@@ -176,11 +166,9 @@ func (p *Processor) InitCursor(ctx context.Context, position int64) error {
 
 func (p *Processor) Start(ctx context.Context) error {
 	var errRtv error
-
 	var positionLock sync.Mutex
-	for {
-		pl := pool.New().WithMaxGoroutines(10).WithContext(ctx).WithCancelOnError()
 
+	for {
 		if p.isQuit.Load() {
 			slog.Warn("processor has be request to quit", "process", p.name)
 			break
@@ -210,7 +198,7 @@ func (p *Processor) Start(ctx context.Context) error {
 		}
 
 		var latestPosition int64
-
+		pl := pool.New().WithMaxGoroutines(10).WithContext(ctx).WithCancelOnError()
 		for _, msg := range msgs {
 			msg := msg
 			pl.Go(func(ctx context.Context) error {
@@ -226,8 +214,9 @@ func (p *Processor) Start(ctx context.Context) error {
 			})
 		}
 
-		if err := pl.Wait(); err != nil {
-			return err
+		if errWait := pl.Wait(); errWait != nil {
+			errRtv = errWait
+			break
 		}
 
 		if latestPosition > 0 {
@@ -243,7 +232,7 @@ func (p *Processor) Start(ctx context.Context) error {
 	return errRtv
 }
 
-func (p *Processor) Shutdown(ctx context.Context) error {
+func (p *Processor) Shutdown() error {
 	slog.Info("processor is shutdowning")
 	p.isQuit.Store(true)
 	select {
